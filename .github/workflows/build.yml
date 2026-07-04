@@ -1,0 +1,103 @@
+name: Build
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - master
+
+jobs:
+  build:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies and PyInstaller
+        run: pip install -r requirements.txt pyinstaller -U
+
+      - name: Create version info file
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path .\base.py -Pattern 'VERSION = \"v(.*?)\"').Matches.Groups[1].Value
+          $parts = $version -split '\.'
+          while ($parts.Count -lt 4) { $parts += '0' }
+          $ver = $parts -join ','
+
+          @"
+          VSVersionInfo(
+            ffi=FixedFileInfo(
+              filevers=($ver),
+              prodvers=($ver),
+              mask=0x3f,
+              flags=0x0,
+              OS=0x40004,
+              fileType=0x1,
+              subtype=0x0,
+              date=(0, 0)
+            ),
+            kids=[
+              StringFileInfo([
+                StringTable(
+                  u'040904B0',
+                  [StringStruct(u'CompanyName', u'MeherMankar'),
+                   StringStruct(u'FileDescription', u'Discounted Udemy Course Enroller'),
+                   StringStruct(u'FileVersion', u'$version'),
+                   StringStruct(u'InternalName', u'DUCE'),
+                   StringStruct(u'LegalCopyright', u'Copyright (c) MeherMankar'),
+                   StringStruct(u'OriginalFilename', u'DUCE.exe'),
+                   StringStruct(u'ProductName', u'Discounted Udemy Course Enroller'),
+                   StringStruct(u'ProductVersion', u'$version')])
+              ]),
+              VarFileInfo([VarStruct(u'Translation', [1033, 1200])])
+            ]
+          )
+          "@ | Out-File -FilePath version_info.txt -Encoding utf8
+
+      - name: Build Executables
+        run: |
+          # Common PyInstaller flags to reduce AV false positives:
+          #   --noupx          : UPX compression itself triggers some AV heuristics
+          #   --exclude-module : strip modules that are never used but inflate the binary
+          #                      and match known malware patterns (e.g. pycryptodome compat shims)
+
+          # Build GUI (windowed, no console)
+          pyinstaller -y -F --noupx --clean -i "extra/DUCE-LOGO.ico" --version-file "version_info.txt" --exclude-module altgraph --exclude-module pefile --exclude-module _bootlocale --exclude-module distutils --exclude-module pkg_resources --exclude-module unittest --exclude-module xmlrpc --exclude-module ftplib --exclude-module imaplib --exclude-module smtplib --exclude-module poplib --exclude-module telnetlib --exclude-module nntplib --exclude-module antigravity --exclude-module this --add-data "default-duce-gui-settings.json;." --add-data "README.md;." --add-data "LICENSE;." -w --name "DUCE-GUI-windows" "gui.py"
+
+          # Build CLI (console window)
+          pyinstaller -y -F --noupx --clean -i "extra/DUCE-LOGO.ico" --version-file "version_info.txt" --exclude-module altgraph --exclude-module pefile --exclude-module _bootlocale --exclude-module distutils --exclude-module pkg_resources --exclude-module unittest --exclude-module xmlrpc --exclude-module ftplib --exclude-module imaplib --exclude-module smtplib --exclude-module poplib --exclude-module telnetlib --exclude-module nntplib --exclude-module antigravity --exclude-module this --add-data "default-duce-cli-settings.json;." --add-data "README.md;." --add-data "LICENSE;." -c --name "DUCE-CLI-windows" "cli.py"
+
+      - name: Upload Windows Package
+        uses: actions/upload-artifact@v4
+        with:
+          name: DUCE-windows-package
+          path: ./dist/
+
+      - name: Get Version
+        if: github.event_name == 'workflow_dispatch'
+        id: get_version
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path .\base.py -Pattern 'VERSION = \"(v.*?)\"').Matches.Groups[1].Value
+          echo "VERSION=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          echo "TAG=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Create Draft Release and Tag
+        if: github.event_name == 'workflow_dispatch'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.get_version.outputs.TAG }}
+          name: ${{ steps.get_version.outputs.TAG }}
+          body: |
+            Draft release for version ${{ steps.get_version.outputs.TAG }}
+          draft: true
+          prerelease: false
+          files: |
+            dist/*
