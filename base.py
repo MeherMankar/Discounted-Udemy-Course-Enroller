@@ -1259,9 +1259,43 @@ class Udemy:
             raise Exception("Course not found")
 
         if self.course.coupon_code and "redeem_coupon" in r:
-            discount = r["purchase"]["data"]["pricing_result"]["discount_percent"]
-            status = r["redeem_coupon"]["discount_attempts"][0]["status"]
-            self.course.is_coupon_valid = discount == 100 and status == "applied"
+            try:
+                discount_attempts = r["redeem_coupon"].get("discount_attempts", [])
+                status = discount_attempts[0]["status"] if discount_attempts else "none"
+
+                # Get discounted price — if it's 0, the coupon makes it free
+                pricing_result = r["purchase"]["data"].get("pricing_result", {})
+                discount_percent = pricing_result.get("discount_percent", 0)
+                discounted_price = (
+                    r["purchase"]["data"]
+                    .get("pricing_result", {})
+                    .get("price", {})
+                    .get("amount", None)
+                )
+
+                logger.info(
+                    f"Coupon check: status={status}, discount={discount_percent}%, "
+                    f"discounted_price={discounted_price}, list_price={self.course.price}"
+                )
+
+                # Valid if: status is applied AND (discount is 100% OR discounted price is 0)
+                self.course.is_coupon_valid = (
+                    status == "applied"
+                    and (
+                        float(discount_percent) >= 100
+                        or discounted_price == 0
+                        or discounted_price == "0"
+                        or discounted_price == 0.0
+                    )
+                )
+            except (KeyError, IndexError, TypeError) as e:
+                logger.error(f"Error parsing coupon response: {e}")
+                logger.error(f"redeem_coupon data: {r.get('redeem_coupon')}")
+                logger.error(f"purchase data keys: {list(r.get('purchase', {}).get('data', {}).keys())}")
+                self.course.is_coupon_valid = False
+        elif self.course.coupon_code and "redeem_coupon" not in r:
+            logger.warning(f"'redeem_coupon' key missing from API response for coupon {self.course.coupon_code}")
+            logger.debug(f"API response keys: {list(r.keys())}")
 
     def save_course(self):
         if self.settings["save_txt"]:
@@ -1281,89 +1315,243 @@ class Udemy:
             return False
         return slug in self.enrolled_courses
 
-    def start_new_enroll(
-        self,
-    ):  # no queue, bulk checkout - Now filters courses first, Experimental
-        """Filters scraped courses based on validity, settings, and coupon status."""
+    def _process_single_course(self, course: "Course", index: int) -> str:
+        """Process a single course: fetch metadata, check coupon.
+        Returns a status string: 'already_enrolled', 'invalid', 'excluded',
+        'free', 'valid_coupon', 'expired', or 'free_enrolled'.
+        Thread-safe — does NOT mutate shared counters.
+        """
+        # Quick check against the enrolled list loaded at login
+        slug = course.slug
+        if slug and slug in self.enrolled_courses:
+            logger.info(
+                f"[{index}] Already enrolled: {course.title}"
+            )
+            return "already_enrolled"
+
+        # Fetch course page to get course_id + metadata
+        self.course = course  # needed by get_course_id / check_course
+        self._get_course_id_for(course)
+
+        if not course.is_valid:
+            logger.error(f"[{index}] Invalid: {course.error}")
+            return "invalid"
+
+        # Re-check after slug may have been updated by redirect
+        if course.slug and course.slug in self.enrolled_courses:
+            logger.info(f"[{index}] Already enrolled (post-redirect): {course.title}")
+            return "already_enrolled"
+
+        if course.is_excluded:
+            logger.info(f"[{index}] Excluded: {course.title}")
+            return "excluded"
+
+        if course.is_free:
+            if self.settings["discounted_only"]:
+                logger.info(f"[{index}] Free course excluded (discounted_only): {course.title}")
+                return "excluded"
+            return "free"
+
+        # Paid course — validate coupon
+        self._check_course_for(course)
+        if course.is_coupon_valid:
+            logger.info(f"[{index}] Valid coupon: {course.title}")
+            return "valid_coupon"
+        else:
+            logger.info(f"[{index}] Coupon expired: {course.title}")
+            return "expired"
+
+    def _get_course_id_for(self, course: "Course"):
+        """Thread-safe version of get_course_id that operates on a specific course."""
+        if course.course_id:
+            return
+        url = re.sub(r"\W+$", "", unquote(course.url))
+        r = None
+        for _ in range(3):
+            try:
+                r = self.client.get(url)
+                break
+            except requests.exceptions.ConnectionError:
+                r = None
+            except Exception as e:
+                logger.error(f"Error fetching course ID: {e}")
+                r = None
+
+        if r is None:
+            course.is_valid = False
+            course.error = "Failed to fetch course ID"
+            return
+
+        course.set_url(r.url)
+        soup = bs(r.content, "lxml")
+        course_id = soup.find("body").get("data-clp-course-id", "invalid")
+        if course_id == "invalid":
+            course.is_valid = False
+            course.error = "Course ID not found"
+            return
+
+        course.course_id = course_id
+        try:
+            dma = json.loads(soup.find("body")["data-module-args"])
+        except Exception as e:
+            course.is_valid = False
+            course.error = f"Failed to parse page data: {e}"
+            return
+
+        course.set_metadata(dma)
+        if not course.is_valid:
+            return
+
+        # Exclusion check (reads self.settings — read-only, thread-safe)
+        self.course = course
+        self.is_course_excluded()
+
+    def _check_course_for(self, course: "Course"):
+        """Thread-safe version of check_course that operates on a specific course."""
+        if course.price is not None:
+            return
+        url = f"https://www.udemy.com/api-2.0/course-landing-components/{course.course_id}/me/?components=purchase"
+        if course.coupon_code:
+            url += f",redeem_coupon&couponCode={course.coupon_code}"
+
+        r = None
+        for _ in range(3):
+            try:
+                r = self.client.get(url).json()
+                break
+            except Exception as e:
+                logger.error(f"Error fetching course data: {e}")
+                r = None
+
+        if r is None:
+            return
+
+        amount = (
+            r.get("purchase", {})
+            .get("data", {})
+            .get("list_price", {})
+            .get("amount", None)
+        )
+        course.price = Decimal(str(amount)) if amount is not None else None
+
+        if course.coupon_code and "redeem_coupon" in r:
+            try:
+                discount_attempts = r["redeem_coupon"].get("discount_attempts", [])
+                status = discount_attempts[0]["status"] if discount_attempts else "none"
+                pricing_result = r["purchase"]["data"].get("pricing_result", {})
+                discount_percent = pricing_result.get("discount_percent", 0)
+                discounted_price = pricing_result.get("price", {}).get("amount", None)
+
+                logger.info(
+                    f"Coupon check [{course.title[:40]}]: status={status}, "
+                    f"discount={discount_percent}%, discounted_price={discounted_price}"
+                )
+
+                course.is_coupon_valid = status == "applied" and (
+                    float(discount_percent) >= 100
+                    or discounted_price in (0, 0.0, "0")
+                )
+            except (KeyError, IndexError, TypeError) as e:
+                logger.error(f"Error parsing coupon response: {e}")
+                course.is_coupon_valid = False
+        elif course.coupon_code and "redeem_coupon" not in r:
+            logger.warning(
+                f"'redeem_coupon' missing from API response for {course.coupon_code}"
+            )
+
+    def start_new_enroll(self):
+        """Parallel course processing with bulk checkout."""
         logger.info("Starting enrollment process")
         self.setup_txt_file()
 
         courses: list[Course] = self.scraped_data
         self.total_courses = len(courses)
         self.valid_courses: list[Course] = []
-        self.total_courses_processed = 0  # Track progress for UI display
+        self.total_courses_processed = 0
 
-        for index, current_course in enumerate(courses):
-            self.course = current_course
-            self.total_courses_processed = (
-                index + 1
-            )  # Update processing counter for UI thread
+        # Counters protected by a lock since threads update them
+        _lock = threading.Lock()
 
-            logger.info(
-                f"Processing course {index + 1} / {self.total_courses}: {str(self.course)}"
-            )
-            if self.is_already_enrolled():
-                logger.info(
-                    f"Already enrolled on {self.get_date_from_utc(self.enrolled_courses[self.course.slug])}"
-                )
-                self.already_enrolled_c += 1
-            else:
-                self.get_course_id()
-                if not self.course.is_valid:
-                    logger.error(f"Invalid: {self.course.error}")
-                    self.excluded_c += 1
+        def process_and_categorize(args):
+            index, course = args
+            try:
+                result = self._process_single_course(course, index)
+            except Exception as e:
+                logger.exception(f"Unexpected error processing course {course}: {e}")
+                result = "invalid"
 
-                elif self.is_already_enrolled():
-                    logger.info(
-                        f"Already enrolled on {self.get_date_from_utc(self.enrolled_courses[self.course.slug])}"
-                    )
+            with _lock:
+                self.total_courses_processed = index + 1
+                if result == "already_enrolled":
                     self.already_enrolled_c += 1
-                elif self.course.is_excluded:
+                elif result in ("invalid", "excluded"):
                     self.excluded_c += 1
-
-                elif self.course.is_free:
-
-                    if self.settings["discounted_only"]:
-                        logger.info(
-                            "Free course excluded (discounted only setting)",
-                            color="light blue",
-                        )
-                        self.excluded_c += 1
-                    else:
-                        self.free_checkout()
-                        if self.course.status:
-                            logger.success("Successfully Subscribed")
-                            self.successfully_enrolled_c += 1
-                            self.save_course()
-                        else:
-                            logger.info(
-                                "Unknown Error: Report this link to the developer",
-                            )
-                            self.expired_c += 1
-
-                elif not self.course.is_free:
-                    self.check_course()
-                    if not self.course.is_coupon_valid:
-                        logger.info("Coupon Expired")
-                        self.expired_c += 1
-
-                if self.course.is_coupon_valid:
-                    self.valid_courses.append(self.course)
-                    logger.info("Added for enrollment")
-
-                self.update_progress()
-                if len(self.valid_courses) >= 5:
-                    self.bulk_checkout()
-                    self.valid_courses.clear()
+                elif result == "expired":
+                    self.expired_c += 1
+                # "free" and "valid_coupon" are handled after collection
             self.update_progress()
+            return index, course, result
 
+        free_courses: list[Course] = []
+
+        # Run course checks in parallel (20 workers — fast without hammering Udemy too hard)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
+            futures = [
+                executor.submit(process_and_categorize, (i, c))
+                for i, c in enumerate(courses)
+            ]
+            for future in concurrent.futures.as_completed(futures):
+                try:
+                    index, course, result = future.result()
+                except Exception as e:
+                    logger.exception(f"Future error: {e}")
+                    continue
+
+                if result == "free":
+                    free_courses.append(course)
+                elif result == "valid_coupon":
+                    with _lock:
+                        self.valid_courses.append(course)
+                        if len(self.valid_courses) >= 5:
+                            batch = self.valid_courses[:5]
+                            self.valid_courses = self.valid_courses[5:]
+                        else:
+                            batch = None
+
+                    if batch:
+                        self.bulk_checkout_courses(batch)
+
+        # Handle free courses sequentially (subscribe API is simple)
+        for course in free_courses:
+            self.course = course
+            self.free_checkout()
+            if course.status:
+                logger.success(f"Successfully subscribed to free: {course.title}")
+                self.successfully_enrolled_c += 1
+                self.save_course()
+            else:
+                logger.info(f"Unknown error on free course: {course.title}")
+                self.expired_c += 1
+
+        # Flush any remaining valid coupon courses
         if self.valid_courses:
-            self.bulk_checkout()
+            self.bulk_checkout_courses(self.valid_courses)
             self.valid_courses.clear()
+
         logger.info("Enrollment process completed")
         logger.info(
-            f"Successfully Enrolled: {self.successfully_enrolled_c}\nAlready Enrolled: {self.already_enrolled_c}\nExpired: {self.expired_c}\nExcluded: {self.excluded_c}"
+            f"Successfully Enrolled: {self.successfully_enrolled_c}\n"
+            f"Already Enrolled: {self.already_enrolled_c}\n"
+            f"Expired: {self.expired_c}\n"
+            f"Excluded: {self.excluded_c}"
         )
+
+    def bulk_checkout_courses(self, courses: list):
+        """Checkout a specific list of courses (thread-safe wrapper for bulk_checkout)."""
+        old = self.valid_courses
+        self.valid_courses = courses
+        self.bulk_checkout()
+        self.valid_courses = old
 
     def setup_txt_file(self):
         if self.settings["save_txt"]:

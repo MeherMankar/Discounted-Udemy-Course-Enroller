@@ -31,20 +31,31 @@ sg.set_options(
 )
 
 
+def _window_alive():
+    """Check if the main window is still open and usable."""
+    return main_window is not None and main_window.TKroot is not None
+
+
 def update_enrolled_courses():
-    while True:
+    while _window_alive():
         logger.debug(f"Enrolled courses count: {len(udemy.enrolled_courses)}")
         new_menu = [
             ["Help", ["Support", "Github", "Discord"]],
             [f"Total Courses: {len(udemy.enrolled_courses)}"],
         ]
-        main_window.write_event_value("Update-Menu", new_menu)
+        try:
+            if _window_alive():
+                main_window.write_event_value("Update-Menu", new_menu)
+        except Exception:
+            break
         time.sleep(10)
 
 
 def create_scraping_thread(site: str):
     logger.info(f"Launching scraping thread for site: {site}")
     code_name = scraper_dict[site]
+    if not _window_alive():
+        return
     main_window[f"i{site}"].update(visible=False)
     main_window[f"p{site}"].update(0, visible=True)
 
@@ -55,10 +66,13 @@ def create_scraping_thread(site: str):
         if getattr(scraper, f"{code_name}_length") == -1:
 
             raise Exception(f"Error in: {site}")
-        main_window[f"p{site}"].update(0, max=getattr(scraper, f"{code_name}_length"))
+        if _window_alive():
+            main_window[f"p{site}"].update(0, max=getattr(scraper, f"{code_name}_length"))
         while not getattr(scraper, f"{code_name}_done") and not getattr(
             scraper, f"{code_name}_error"
         ):
+            if not _window_alive():
+                return
             main_window[f"p{site}"].update(
                 getattr(scraper, f"{code_name}_progress") + 1,
                 max=getattr(scraper, f"{code_name}_length"),
@@ -73,12 +87,20 @@ def create_scraping_thread(site: str):
     except Exception:
         error_message = getattr(scraper, f"{code_name}_error", "Unknown Error")
         logger.exception(f"Error in {site}: {error_message}")
-        main_window.write_event_value(
-            "Error", f"{error_message}|:|Unknown Error in: {site} {VERSION}"
-        )
+        try:
+            if _window_alive():
+                main_window.write_event_value(
+                    "Error", f"{error_message}|:|Unknown Error in: {site} {VERSION}"
+                )
+        except Exception:
+            pass
     finally:
-        main_window[f"p{site}"].update(0, visible=False)
-        main_window[f"i{site}"].update(visible=True)
+        try:
+            if _window_alive():
+                main_window[f"p{site}"].update(0, visible=False)
+                main_window[f"i{site}"].update(visible=True)
+        except Exception:
+            pass
 
 
 ##########################################
@@ -100,29 +122,33 @@ def scrape():
         total_courses = len(udemy.scraped_data)
 
         def update_progress():
+            if not _window_alive():
+                return
+            try:
+                if hasattr(udemy, "course") and udemy.course:
+                    main_window["current_course_title"].update(value=udemy.course.title)
+                    main_window["current_course_url"].update(value=udemy.course.url)
 
-            if hasattr(udemy, "course") and udemy.course:
-                main_window["current_course_title"].update(value=udemy.course.title)
-                main_window["current_course_url"].update(value=udemy.course.url)
+                if hasattr(udemy, "total_courses_processed"):
+                    progress_text = (
+                        f"Course {udemy.total_courses_processed:4d}/{total_courses:4d}"
+                    )
+                    main_window["course_progress"].update(value=progress_text)
 
-            if hasattr(udemy, "total_courses_processed"):
-                progress_text = (
-                    f"Course {udemy.total_courses_processed:4d}/{total_courses:4d}"
+                main_window["stat_enrolled"].update(
+                    value=f"{udemy.successfully_enrolled_c}"
                 )
-                main_window["course_progress"].update(value=progress_text)
+                main_window["stat_amount_saved"].update(
+                    value=f"{round(udemy.amount_saved_c, 2)} {udemy.currency.upper()}"
+                )
+                main_window["stat_already"].update(value=f"{udemy.already_enrolled_c}")
+                main_window["stat_excluded"].update(value=f"{udemy.excluded_c}")
+                main_window["stat_expired"].update(value=f"{udemy.expired_c}")
 
-            main_window["stat_enrolled"].update(
-                value=f"{udemy.successfully_enrolled_c}"
-            )
-            main_window["stat_amount_saved"].update(
-                value=f"{round(udemy.amount_saved_c, 2)} {udemy.currency.upper()}"
-            )
-            main_window["stat_already"].update(value=f"{udemy.already_enrolled_c}")
-            main_window["stat_excluded"].update(value=f"{udemy.excluded_c}")
-            main_window["stat_expired"].update(value=f"{udemy.expired_c}")
-
-            ready_count = len(getattr(udemy, "valid_courses", []))
-            main_window["stat_ready_enroll"].update(value=f"{ready_count}/5")
+                ready_count = len(getattr(udemy, "valid_courses", []))
+                main_window["stat_ready_enroll"].update(value=f"{ready_count}/5")
+            except Exception:
+                pass
 
         udemy.update_progress = update_progress
 
