@@ -491,7 +491,7 @@ class Scraper:
                     r"load_content\"\:\"(.*?)\"", content.decode("utf-8"), re.DOTALL
                 ).group(1)
                 logger.debug(f"Nonce: {nonce}")
-            except IndexError:
+            except (IndexError, AttributeError):
                 self.set_attr("error", "Nonce not found")
                 self.set_attr("length", -1)
                 self.set_attr("done", True)
@@ -511,14 +511,28 @@ class Scraper:
             def _fetch_course_details(item):
                 """Helper method to fetch course details"""
                 title = item.h5.string
-                content = self.fetch_page(item.a["href"]).content
+                course_url = item.a["href"]
+                content = self.fetch_page(course_url).content
                 soup = self.parse_html(content)
-                button = soup.find(
-                    "a",
+                # Try multiple selectors for the affiliate/external link button
+                link = None
+                for selector in [
                     {"class": "masterstudy-button-affiliate__link"},
-                )
-                link = button["href"] if button else ""
-                return title, link
+                    {"class": "affiliate_link"},
+                    {"class": "wp-block-button__link"},
+                ]:
+                    button = soup.find("a", selector)
+                    if button and button.get("href"):
+                        link = button["href"]
+                        break
+                # Fallback: look for any anchor directly pointing to udemy.com
+                if not link:
+                    for anchor in soup.find_all("a", href=True):
+                        href = anchor["href"]
+                        if "udemy.com/course/" in href:
+                            link = href
+                            break
+                return title, link or ""
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=30) as executor:
                 future_course_details = [
@@ -528,11 +542,13 @@ class Scraper:
                     concurrent.futures.as_completed(future_course_details)
                 ):
                     title, link = future.result()
-                    if "udemy.com" in link:
+                    if link and "udemy.com" in link:
                         link = self.cleanup_link(link)
                         self.append_to_list(title, link)
-                    else:
+                    elif link:
                         logger.error(f"Unknown link format: {link}")
+                    else:
+                        logger.debug(f"No Udemy link found for course: {title}")
                     self.set_attr("progress", i + 1)
         except Exception:
             self.handle_exception()

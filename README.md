@@ -82,13 +82,6 @@ The pre-built `.exe` files are packaged with [PyInstaller](https://pyinstaller.o
 
 ![](/extra/disclaimer.png)
 
-## Donate
-
-BTC `bc1qdyjwj0eqxjk5hxejah4gyclrumwtqs3hqp63uz`
-
-BTC `14JNjiNoiKcbCHcxcqUxgJcVgyDfhGbxQF`
-
-
 <center>
 Made with ❤️
 </center>
